@@ -3,7 +3,7 @@
 
 #######################################
 ##
-##   COVID-19 metapopulation model   
+##   COVID-19 metapopulation model  with temporary containtment policies 
 ##
 #######################################
 
@@ -40,7 +40,7 @@ func_label.lowtri <- function(M){
 # Function - vector of interaction in graph
 func_gr.adj.vec <- function(graph){ as.matrix(as_adj(graph))[lower.tri(as.matrix(as_adj(graph)))]}
 
-# Function - Random network model (Erdos-Rényi): G(N,p) model: each pair of N nodes is connected with probability p (Gilbert)
+# Function - Random network model (Erdos-RÃ©nyi): G(N,p) model: each pair of N nodes is connected with probability p (Gilbert)
 func_gr.random <-  function(M, p){ sample_gnp(M, p, directed = FALSE, loops = FALSE)}
 
 # Function - Scale-free networks
