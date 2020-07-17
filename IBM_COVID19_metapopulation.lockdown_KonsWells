@@ -1,0 +1,378 @@
+
+
+
+#######################################
+##
+##   COVID-19 metapopulation model   
+##
+#######################################
+
+
+library(raster)
+library(igraph)
+library(data.table)
+library(lhs)
+
+###############
+# Functions for generating metapopulation network
+
+# Function - population sizes
+PopSizeSample <- function(PopSizeTotal, M) { 
+	draw <- rexp(M, 1)
+	rel.popsize <- draw/sum(draw)
+	pop.id <- c(1:M, sample(1:M, size=(PopSizeTotal-M), rel.popsize, replace=T))
+	Pop_N <- as.numeric(table(pop.id))
+	Pop_N
+}
+
+# Function - labels of matrix low.tri
+func_label.lowtri <- function(M){
+	pop.id <- paste("p.", 1:M, sep="")
+	Pop.i <- Pop.j <- NA 
+	for(i in 1:(M-1)){
+		Pop.i <- c(Pop.i, rep(pop.id[i], (M-i)))
+		Pop.j <- c(Pop.j, pop.id[((i+1):M)])
+	}
+	Pop.i <- Pop.i[!is.na(Pop.i)]; Pop.j <- Pop.j[!is.na(Pop.j)]
+	data.frame(Pop.i, Pop.j)
+}
+
+# Function - vector of interaction in graph
+func_gr.adj.vec <- function(graph){ as.matrix(as_adj(graph))[lower.tri(as.matrix(as_adj(graph)))]}
+
+# Function - Random network model (Erdos-Rényi): G(N,p) model: each pair of N nodes is connected with probability p (Gilbert)
+func_gr.random <-  function(M, p){ sample_gnp(M, p, directed = FALSE, loops = FALSE)}
+
+# Function - Scale-free networks
+func_gr.scalefree <-  function(M, m){ barabasi.game(M, power = 1.2, m = m, out.dist = NULL, out.seq = NULL, out.pref = FALSE, zero.appeal = 1, directed = FALSE,
+  algorithm ="psumtree", start.graph = NULL)}
+
+# Function - Small-world networks
+func_gr.smwrld <-  function(M,n){ watts.strogatz.game(1, M, n, 0.35, loops = FALSE, multiple = FALSE)}
+
+# Function - calculate relevant parameters to amke different network types comparable
+network_param <- function(N, C, type){
+  if(type == 'random'){
+    return(C)
+  }else if(type == 'small-world'){
+    return(C*N/2)
+  }else if(type == 'scale-free'){
+    return((0.53333333 * C) / (1/N))
+  }
+}
+
+
+#######
+# Functions for SEIR model
+
+func.expose.meta.mit <- function(inds, N_meta.1, N_meta.2, prevI_meta.1, prevI_meta.2, beta, infectiousness, mitYesNo, mitB, mitSelYN){
+    select.S <- which(inds$Status=="S")  
+    select.I <- which(inds$Status=="I")  
+    nS <- length(select.S)
+    nI <- round(length(select.I) + N_meta.1*prevI_meta.1 + N_meta.2*prevI_meta.2)
+    N <- round(length(inds$Status) + N_meta.1 + N_meta.2)
+    if(nS>0){	  
+	 # Number of individual contacts (rbinom(3, 0.25 according to Danon et al. 2012))
+	 ncontact.i <- round(rnbinom(nS, 3, 0.26) + rlnorm(nS, meanlog = 2, sdlog = 1))	
+	 ncontact.i[which(ncontact.i>=(N-1))] <- (N-1) 
+       nI.contact.i <- rbinom(nS, ncontact.i, nI/N) 
+    
+  	 risk.i <-  inds$Risk[select.S]
+	 # betas for 1) without mitigation 2) mitigation high risk 3) low risk if selective 4) low risk if non-selective mitigation	
+	 beta.i <- beta*(1-mitYesNo) + beta*(1-mitB)*mitYesNo*risk.i + 
+				beta*mitYesNo*mitSelYN*(1-risk.i) + beta*(1-mitB)*mitYesNo*(1-mitSelYN)*(1-risk.i)
+	lambda.i <- beta.i * infectiousness * nI.contact.i  
+	lambda.i[which(lambda.i>1)] <- 1
+      infect.i <- rbinom(nS,1,lambda.i)
+      # Update individual infection status
+      inds$Status[select.S[which(infect.i==1)]] <- "E"    
+    }else{} 
+    return(inds)    
+}  
+
+func.infectious <- function(inds, incub.d){
+    select.E <- which(inds$Status=="E") 
+    nE <- length(select.E)
+    if(nE>0){	  
+	kappa <- 1/ runif(nE, incub.d[1], incub.d[2])
+	transEI <- rbinom(nE,1,kappa)
+      inds$Status[select.E[which(transEI==1)]] <- "I"
+    }else{} 
+    return(inds)    
+}
+
+func.recov <- function(inds, infectious.d){
+    select.I <- which(inds$Status=="I")  
+    nI <- length(select.I) # number of infected ind.
+    if(nI>0){
+		gamma <- 1/ runif(nI, infectious.d[1], infectious.d[2]) 
+            recover <- rbinom(nI,1,gamma)
+             # Update individual infection status
+             inds$Status[select.I[which(recover==1)]] <- "R"
+    }else{} 
+    return(inds)    
+}
+
+
+
+######################################3
+#
+# Run simulations
+#
+#####################################
+
+############
+## Metapopulation parameters
+
+# Total population size
+PopSizeTotal <- 10000
+
+# Average incubation period incub.d
+incub.d <- c(4,6)
+
+# Average infectious period infectious.d
+infectious.d <- c(7,10)
+
+#Sampled:  beta <- 0.8
+
+# Contact rate
+infectiousness <- 1
+
+# Number of time steps for running simulations
+T <- 365
+time <- 1:T
+
+# Number of individuals initially infected
+n.infect <- 10
+
+
+# Proportion of population at high risk of severe disease impact
+p.risk <- 0.1
+
+
+########################
+#  Construct hybercube of parameter combination for different scenarios
+
+
+#########################
+# Random combination of paramters to be sampled
+
+# Names of parameters to be sampled
+param_names <- c("C", "beta", "disp.rate", "jump.rate", "mitB", "mitDays")
+nparam <- length(param_names)
+NSample <- 1000
+
+Param_ranges <- data.frame(
+	C <- c(0.1, 0.5),
+	beta <- c(0.001, 0.3),
+	disp.rate <- c(0.001, 0.2),
+	jump.rate <- c(0.001, 0.2),
+	mitB <- c(0.1, 0.9),		
+	mitDays <- c(21, 300)
+)
+
+# Hypercube of parameters
+LHS <- randomLHS(n = NSample, k= nparam, preserveDraw = TRUE)
+SampCube <- matrix(NA, nrow = nparam, ncol = NSample)
+for(p in 1:nparam){
+	SampCube[p, ] <- qunif(LHS[ ,p], min(Param_ranges[,p ]), max(Param_ranges[,p ]))
+}
+
+rownames(SampCube) <- param_names
+
+# Categorical combination to be sampled (different network types, mitigation strategy and control)   
+netw.type_sc <- c(1,2,3)
+mitSelYN_sc <- c(1,0)
+Mit_sc <- c(1,0) 
+
+grid_names <- c("netw.type", "mitSelYN", "Mit")
+
+grid <- rbind(
+	expand.grid(netw.type=netw.type_sc, Mit=Mit_sc[1], mitSelYN=mitSelYN_sc),
+	expand.grid(netw.type=netw.type_sc, Mit=Mit_sc[2], mitSelYN=mitSelYN_sc[2])
+)
+NGrid = dim(grid)[1]
+
+# Combine random samples and grid into hypercube
+
+hypcube_names <- c("sampNo", "Gridno", grid_names, param_names)
+NVar <- length(hypcube_names)
+NSim <- NGrid*NSample
+
+###   HypCube <- array(NA, dim=c(NVar, NSim))
+rownames(HypCube) <- hypcube_names
+
+sortsamp <- sort(rep(1:NSample, NGrid))
+HypCube["netw.type", ] <- rep(grid$netw.type, NSample)
+HypCube["mitSelYN", ] <- rep(grid$mitSelYN, NSample)
+HypCube["Mit", ] <- rep(grid$Mit, NSample)
+HypCube["C", ] <- SampCube["C",] [sortsamp]
+HypCube["beta", ] <- SampCube["beta",] [sortsamp]
+HypCube["disp.rate", ] <- SampCube["disp.rate",] [sortsamp]
+HypCube["jump.rate", ] <- SampCube["jump.rate",] [sortsamp]
+HypCube["mitB", ] <- SampCube["mitB",] [sortsamp]
+HypCube["mitDays", ] <- SampCube["mitDays",] [sortsamp]
+
+## save(HypCube, file="HypCube.RData")
+load("HypCube.RData")
+
+###########
+# Run simulations
+
+x.start <-1
+x.end <- NSim
+
+RUN.SIM <- function(x.start, x.end){
+
+for(x in x.start:x.end){
+	# Parameters from hypercube
+	netw.type <- HypCube["netw.type", x]
+	M <- 100
+	C <- HypCube["C", x] 
+	beta <- HypCube["beta", x]
+	disp.rate <- HypCube["disp.rate", x]
+	jump.rate <- HypCube["jump.rate", x]
+	mitB <- HypCube["mitB", x]
+	mitDays <- HypCube["mitDays", x]
+	mitSelYN <- HypCube["mitSelYN", x]
+	Mit  <- HypCube["Mit", x]
+
+	# Generate metapopulation adjacency/ network interactions
+	if(netw.type==1){
+		graph <- func_gr.random(M, network_param(M, C, 'random')) }
+	if(netw.type==2){
+		graph <- func_gr.scalefree(M, network_param(M, C, 'scale-free')) }
+	if(netw.type==3){
+		graph <- func_gr.smwrld(M, network_param(M, C, 'small-world')) }
+
+	MetapopInteract <- data.frame(cbind(func_label.lowtri(M), Connect = func_gr.adj.vec (graph)))
+
+	# Degrees of different populations
+	Pop_degree <-  degree(graph)
+
+	Pop_eigen.centrality <- round(eigen_centrality(graph, directed = FALSE, scale = TRUE, weights = NULL,options = arpack_defaults)$vector, 3)
+
+	# Vector of different population sizes (biggest to those with highest degree)
+	Pop_N <- sort(PopSizeSample(PopSizeTotal, M))[order(order(degree(graph)))]
+
+	Pop_ID <- paste("p.", 1:M, sep="")
+	N.total <- sum(Pop_N)
+
+	# Generate data.frame of individuals
+	attribute.names <- c("Pop.ID", "Status", "Risk")
+	n.attribute <- length(attribute.names ) 
+	Inds.sim <- data.frame(array(NA, dim=c(N.total, n.attribute)))
+	colnames(Inds.sim) <- attribute.names 
+	# Population ID
+	Inds.sim$Pop.ID <- rep(Pop_ID, Pop_N)
+	Inds.sim$Risk <- rbinom(N.total, 1, p.risk)
+
+	Inds.sim$Status <- "S"
+	# Initial infection
+	sel.infect0 <- which(Inds.sim$Pop.ID==Pop_ID[which(Pop_N==max(Pop_N))[1]])[1:n.infect]
+	Inds.sim$Status[sel.infect0] <- "I"
+
+	# Generate matrices to store output
+	out_names <- c("nS",  "nE",  "nI",  "nR", "newInfect", "newInfect.risk0", "newInfect.risk1")
+	nout <- length(out_names)
+	Out_ind <- array(NA, dim=c(M, T, nout)) 
+	Out_degr <- rep(NA, M)
+	Out_centr <- rep(NA, M)
+
+	# Loop over all time step to iteratively expose individuals to processes
+	t.start <- Sys.time()
+	for(t in 1:T){
+		# Within mitigation period ys/no?	
+		mitYesNo <-  ifelse((t >=7 & t<(7+mitDays) & Mit==1), 1,0)
+
+		# Number/pool of infectious individuals in adjacent and unconnected populations
+		N.pool_adjacent <- rep(NA, M)
+		N.pool_unconnect <- rep(NA, M)
+		nI.pool_adjacent <- rep(NA, M)
+		nI.pool_unconnect <- rep(NA, M)
+		pI_adjacent <- rep(NA, M)
+		pI_unconnect <- rep(NA, M)
+
+		for(m in 1:M){
+		    popID_adjacent <- unique(MetapopInteract$Pop.j[which(MetapopInteract$Pop.i==Pop_ID[m] & MetapopInteract$Connect==1)])
+		    popID_unconnect <- unique(MetapopInteract$Pop.j[which(MetapopInteract$Pop.i==Pop_ID[m] & MetapopInteract$Connect==0)])
+		    N.pool_adjacent[m] <- length(which(!is.na(match(Inds.sim$Pop.ID, popID_adjacent))))
+		    N.pool_unconnect[m] <- length(which(!is.na(match(Inds.sim$Pop.ID, popID_unconnect))))
+
+		    # Number of adjecent infectious individuals
+		    nI.pool_adjacent[m] <- length(which(Inds.sim$Status=="I" & !is.na(match(Inds.sim$Pop.ID, popID_adjacent))))
+		    nI.pool_unconnect[m] <- length(which(Inds.sim$Status=="I" & !is.na(match(Inds.sim$Pop.ID, popID_unconnect))))
+		    # With mitigation strategies, high risk individuals are assumed to travel less accoring to mitigation strength	
+		    nI.pool_adjacent[m] <- round(nI.pool_adjacent[m] * (1-p.risk)+ p.risk*mitYesNo*(1-mitB) + p.risk*(1-mitYesNo))
+		    nI.pool_unconnect[m] <- round(nI.pool_unconnect[m] * (1-p.risk)+ p.risk*mitYesNo*(1-mitB) + p.risk*(1-mitYesNo))
+
+		}
+
+		#Loop over all population with epidemiological dynamics
+		for(m in 1:M){
+		    # Select individuals of local population	
+		    inds <- Inds.sim[which(Inds.sim$Pop.ID==Pop_ID[m]),]
+
+		    # Total number of infectious individuals in adjacent populations
+		    nI_adjacent <- nI.pool_adjacent[m]
+		    nI_unconnect <- nI.pool_unconnect[m]
+
+		    N_adjacent <- N.pool_adjacent[m]
+		    N_unconnect <- N.pool_unconnect[m]
+
+		    pI_unconnect <- nI_adjacent/(N_adjacent + 0.001)
+		    pI_adjacent <-  nI_unconnect/(N_unconnect + 0.001) 
+
+		    # Number of individuals from adjecent populations as commutal traveler
+		    if(N_adjacent>0){	
+			    N.visit_adjacent <- rbinom(1, N_adjacent, disp.rate)			
+		    }else{ N.visit_adjacent <- 0}	
+
+		    # Number of individuals from unconnected populations commutal traveler	
+		    if(N_unconnect>0){	
+			    N.visit_unconnect <- rbinom(1, N_unconnect, jump.rate)			
+		    }else{ N.visit_unconnect <- 0}
+
+		    #  Apply function (processes) to individuals
+
+		    inds <- func.expose.meta.mit(inds, N.visit_unconnect, N.visit_adjacent, pI_unconnect, pI_adjacent, beta, infectiousness, mitYesNo, mitB, mitSelYN)
+	
+		    n.infectious.0 <- length(which(inds$Status=="I"))	
+		    n.infectious.0_risk0 <- length(which(inds$Status=="I" & inds$Risk==0))	
+		    n.infectious.0_risk1 <- length(which(inds$Status=="I" & inds$Risk==1))	
+		    inds <- func.infectious(inds, incub.d)
+		    n.infectious.new <- (length(which(inds$Status=="I")) - n.infectious.0)	
+		    n.infectious.new_risk0 <- (length(which(inds$Status=="I" & inds$Risk==0)) - n.infectious.0_risk0)
+		    n.infectious.new_risk1 <- (length(which(inds$Status=="I" & inds$Risk==1)) - n.infectious.0_risk1)
+
+		    inds <- func.recov(inds, infectious.d)
+
+		    #  Summarize output after exposure of individuals to processes	
+		    Out_ind[m, t, which(out_names=="nS")] <- length(which(inds$Status=="S"))
+		    Out_ind[m, t, which(out_names=="nE")] <- length(which(inds$Status=="E"))
+		    Out_ind[m, t, which(out_names=="nI")] <- length(which(inds$Status=="I"))
+		    Out_ind[m, t, which(out_names=="nR")] <- length(which(inds$Status=="R"))
+		    Out_ind[m, t, which(out_names=="newInfect")] <- n.infectious.new
+
+		    Out_ind[m, t, which(out_names=="newInfect.risk0")] <- n.infectious.new_risk0
+		    Out_ind[m, t, which(out_names=="newInfect.risk1")] <- n.infectious.new_risk1
+
+		    Out_degr[1:M] <- Pop_degree
+		    Out_centr[1:M] <- Pop_eigen.centrality
+
+		    Inds.sim[which(Inds.sim$Pop.ID==Pop_ID[m]),] <- inds
+		    rm(inds)
+		}
+	}
+	save(Out_ind, file=paste("Out.netwEpiM_ind_", x, ".RData", sep=""))
+	save(Out_degr, file=paste("Out.netwEpiM_degr_", x, ".RData", sep=""))
+	save(Out_centr, file=paste("Out.netwEpiM_centr_", x, ".RData", sep=""))
+	print(paste("Sim: ", x, "  ,time:", Sys.time() - t.start))
+	rm(Inds.sim, Out_ind, Out_degr, Out_centr)
+}
+}
+
+RUN.SIM(1, 100)
+
+
+ 
